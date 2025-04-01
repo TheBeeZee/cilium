@@ -7,7 +7,6 @@ import (
 	"log/slog"
 
 	slim_metav1 "github.com/cilium/cilium/pkg/k8s/slim/k8s/apis/meta/v1"
-	policyapi "github.com/cilium/cilium/pkg/policy/api"
 )
 
 // ruleSlice is a wrapper around a slice of *rule, which allows for functions
@@ -29,15 +28,15 @@ func (rules ruleSlice) resolveL4IngressPolicy(logger *slog.Logger, policyCtx Pol
 	// each FromEndpoints for all ingress rules. This ensures that FromRequires
 	// is taken into account when evaluating policy at L4.
 	for _, r := range rules {
+		if !r.ingress {
+			continue
+		}
 		if ctx.rulesSelect || r.getSelector().Matches(ctx.To) {
 			matchedRules = append(matchedRules, r)
-			for _, ingressRule := range r.Ingress {
-				for _, requirement := range ingressRule.FromRequires {
+			for _, requirement := range r.l3 {
+				if !r.deny {
 					requirements = append(requirements, requirement.ConvertToLabelSelectorRequirementSlice()...)
-				}
-			}
-			for _, ingressRule := range r.IngressDeny {
-				for _, requirement := range ingressRule.FromRequires {
+				} else {
 					requirementsDeny = append(requirementsDeny, requirement.ConvertToLabelSelectorRequirementSlice()...)
 				}
 			}
@@ -79,15 +78,15 @@ func (rules ruleSlice) resolveL4EgressPolicy(logger *slog.Logger, policyCtx Poli
 	// ToEndpoints for all egress rules. This ensures that ToRequires is
 	// taken into account when evaluating policy at L4.
 	for _, r := range rules {
+		if r.ingress {
+			continue
+		}
 		if ctx.rulesSelect || r.getSelector().Matches(ctx.From) {
 			matchedRules = append(matchedRules, r)
-			for _, egressRule := range r.Egress {
-				for _, requirement := range egressRule.ToRequires {
+			for _, requirement := range r.l3 {
+				if !r.deny {
 					requirements = append(requirements, requirement.ConvertToLabelSelectorRequirementSlice()...)
-				}
-			}
-			for _, egressRule := range r.EgressDeny {
-				for _, requirement := range egressRule.ToRequires {
+				} else {
 					requirementsDeny = append(requirementsDeny, requirement.ConvertToLabelSelectorRequirementSlice()...)
 				}
 			}
@@ -116,6 +115,7 @@ func (rules ruleSlice) resolveL4EgressPolicy(logger *slog.Logger, policyCtx Poli
 }
 
 // AsPolicyRules return the internal policyapi.Rule objects as a policyapi.Rules object
+/*
 func (rules ruleSlice) AsPolicyRules() policyapi.Rules {
 	policyRules := make(policyapi.Rules, 0, len(rules))
 	for _, r := range rules {
@@ -123,3 +123,4 @@ func (rules ruleSlice) AsPolicyRules() policyapi.Rules {
 	}
 	return policyRules
 }
+*/

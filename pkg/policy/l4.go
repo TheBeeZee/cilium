@@ -840,26 +840,6 @@ func (l4 *L4Filter) cacheFQDNSelector(sel api.FQDNSelector, lbls stringLabels, s
 	return cs
 }
 
-// add L7 rules for all endpoints in the L7DataMap
-func (l7 L7DataMap) addPolicyForSelector(l7Parser L7ParserType, rules *api.L7Rules, terminatingTLS, originatingTLS *TLSContext, auth *api.Authentication, deny bool, sni []string, listener string, priority ListenerPriority) {
-	for epsel := range l7 {
-		l7policy := &PerSelectorPolicy{
-			L7Parser:       l7Parser,
-			TerminatingTLS: terminatingTLS,
-			OriginatingTLS: originatingTLS,
-			Authentication: auth,
-			IsDeny:         deny,
-			ServerNames:    NewStringSet(sni),
-			Listener:       listener,
-			Priority:       priority,
-		}
-		if rules != nil {
-			l7policy.L7Rules = *rules
-		}
-		l7[epsel] = l7policy
-	}
-}
-
 type TLSDirection string
 
 const (
@@ -916,7 +896,7 @@ func (l4 *L4Filter) getCerts(logger *slog.Logger, policyCtx PolicyContext, tls *
 // filter is derived from. This filter may be associated with a series of L7
 // rules via the `rule` parameter.
 // Not called with an empty peerEndpoints.
-func createL4Filter(logger *slog.Logger, policyCtx PolicyContext, peerEndpoints api.EndpointSelectorSlice, auth *api.Authentication, rule api.Ports, port api.PortProtocol,
+func createL4Filter(logger *slog.Logger, policyCtx PolicyContext, peerEndpoints api.EndpointSelectorSlice, l7policy *PerSelectorPolicy, port api.PortProtocol,
 	protocol api.L4Proto, ruleLabels stringLabels, ingress bool, fqdns api.FQDNSelectorSlice,
 ) (*L4Filter, error) {
 	selectorCache := policyCtx.GetSelectorCache()
@@ -952,95 +932,9 @@ func createL4Filter(logger *slog.Logger, policyCtx PolicyContext, peerEndpoints 
 		l4.cacheFQDNSelectors(fqdns, ruleLabels, selectorCache)
 	}
 
-	var l7Parser L7ParserType
-	var terminatingTLS *TLSContext
-	var originatingTLS *TLSContext
-	var rules *api.L7Rules
-	var sni []string
-	listener := ""
-	var priority ListenerPriority
-
-	pr := rule.GetPortRule()
-	if pr != nil {
-		rules = pr.Rules
-		sni = pr.ServerNames
-
-		// Get TLS contexts, if any
-		var err error
-		terminatingTLS, err = l4.getCerts(logger, policyCtx, pr.TerminatingTLS, TerminatingTLS)
-		if err != nil {
-			return nil, err
-		}
-		originatingTLS, err = l4.getCerts(logger, policyCtx, pr.OriginatingTLS, OriginatingTLS)
-		if err != nil {
-			return nil, err
-		}
-
-		// Set parser type to TLS, if TLS. This will be overridden by L7 below, if rules
-		// exists.
-		if terminatingTLS != nil || originatingTLS != nil || len(pr.ServerNames) > 0 {
-			l7Parser = ParserTypeTLS
-		}
-
-		// Determine L7ParserType from rules present. Earlier validation ensures rules
-		// for multiple protocols are not present here.
-		if rules != nil {
-			// we need this to redirect DNS UDP (or ANY, which is more useful)
-			if len(rules.DNS) > 0 {
-				l7Parser = ParserTypeDNS
-			} else if protocol == api.ProtoTCP { // Other than DNS only support TCP
-				switch {
-				case len(rules.HTTP) > 0:
-					l7Parser = ParserTypeHTTP
-				case len(rules.Kafka) > 0:
-					l7Parser = ParserTypeKafka
-				case rules.L7Proto != "":
-					l7Parser = (L7ParserType)(rules.L7Proto)
-				}
-			}
-		}
-
-		// Override the parser type and possibly priority for CRD is applicable.
-		if pr.Listener != nil {
-			l7Parser = ParserTypeCRD
-		}
-
-		// Map parser type to default priority for the given parser type
-		priority = l7Parser.defaultPriority()
-
-		// Override the parser type and possibly priority for CRD is applicable.
-		if pr.Listener != nil {
-			ns := policyCtx.GetNamespace()
-			resource := pr.Listener.EnvoyConfig
-			switch resource.Kind {
-			case "CiliumEnvoyConfig":
-				if ns == "" {
-					// Cluster-scoped CCNP tries to use namespaced
-					// CiliumEnvoyConfig
-					//
-					// TODO: Catch this in rule validation once we have a
-					// validation context in there so that we can differentiate
-					// between CNP and CCNP at validation time.
-					return nil, fmt.Errorf("Listener %q in CCNP can not use Kind CiliumEnvoyConfig", pr.Listener.Name)
-				}
-			case "CiliumClusterwideEnvoyConfig":
-				// CNP refers to a cluster-scoped listener
-				ns = ""
-			default:
-			}
-			listener, _ = api.ResourceQualifiedName(ns, resource.Name, pr.Listener.Name, api.ForceNamespace)
-			if pr.Listener.Priority != 0 {
-				priority = ListenerPriority(pr.Listener.Priority)
-			}
-		}
-	}
-
-	if l7Parser != ParserTypeNone || auth != nil || policyCtx.IsDeny() {
-		l4.PerSelectorPolicies.addPolicyForSelector(l7Parser, rules, terminatingTLS, originatingTLS, auth, policyCtx.IsDeny(), sni, listener, priority)
-	}
-
 	origin := singleRuleOrigin(ruleLabels)
 	for cs := range l4.PerSelectorPolicies {
+		l4.PerSelectorPolicies[cs] = l7policy
 		l4.RuleOrigin[cs] = origin
 	}
 
@@ -1113,10 +1007,10 @@ func (l4 *L4Filter) attach(ctx PolicyContext, l4Policy *L4Policy) policyFeatures
 //
 // hostWildcardL7 determines if L7 traffic from Host should be
 // wildcarded (in the relevant daemon mode).
-func createL4IngressFilter(logger *slog.Logger, policyCtx PolicyContext, fromEndpoints api.EndpointSelectorSlice, auth *api.Authentication, hostWildcardL7 []string, rule api.Ports, port api.PortProtocol,
+func createL4IngressFilter(logger *slog.Logger, policyCtx PolicyContext, fromEndpoints api.EndpointSelectorSlice, l7policy *PerSelectorPolicy, hostWildcardL7 []string, port api.PortProtocol,
 	protocol api.L4Proto, ruleLabels stringLabels,
 ) (*L4Filter, error) {
-	filter, err := createL4Filter(logger, policyCtx, fromEndpoints, auth, rule, port, protocol, ruleLabels, true, nil)
+	filter, err := createL4Filter(logger, policyCtx, fromEndpoints, l7policy, port, protocol, ruleLabels, true, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1141,10 +1035,10 @@ func createL4IngressFilter(logger *slog.Logger, policyCtx PolicyContext, fromEnd
 // specified endpoints and port/protocol for egress traffic, with reference
 // to the original rules that the filter is derived from. This filter may be
 // associated with a series of L7 rules via the `rule` parameter.
-func createL4EgressFilter(logger *slog.Logger, policyCtx PolicyContext, toEndpoints api.EndpointSelectorSlice, auth *api.Authentication, rule api.Ports, port api.PortProtocol,
+func createL4EgressFilter(logger *slog.Logger, policyCtx PolicyContext, toEndpoints api.EndpointSelectorSlice, l7policy *PerSelectorPolicy, port api.PortProtocol,
 	protocol api.L4Proto, ruleLabels stringLabels, fqdns api.FQDNSelectorSlice,
 ) (*L4Filter, error) {
-	return createL4Filter(logger, policyCtx, toEndpoints, auth, rule, port, protocol, ruleLabels, false, fqdns)
+	return createL4Filter(logger, policyCtx, toEndpoints, l7policy, port, protocol, ruleLabels, false, fqdns)
 }
 
 // redirectType returns the redirectType for this filter

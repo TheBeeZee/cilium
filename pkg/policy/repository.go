@@ -125,10 +125,10 @@ type PolicyRepository interface {
 	GetRevision() uint64
 	GetRulesList() *models.Policy
 	GetSelectorCache() *SelectorCache
-	Iterate(f func(rule *api.Rule))
-	ReplaceByResource(rules api.Rules, resource ipcachetypes.ResourceID) (affectedIDs *set.Set[identity.NumericIdentity], rev uint64, oldRevCnt int)
-	ReplaceByLabels(rules api.Rules, searchLabelsList []labels.LabelArray) (affectedIDs *set.Set[identity.NumericIdentity], rev uint64, oldRevCnt int)
-	Search(lbls labels.LabelArray) (api.Rules, uint64)
+	Iterate(f func(rule *policyEntry))
+	ReplaceByResource(rules []*policyEntry, resource ipcachetypes.ResourceID) (affectedIDs *set.Set[identity.NumericIdentity], rev uint64, oldRevCnt int)
+	ReplaceByLabels(rules []*policyEntry, searchLabelsList []labels.LabelArray) (affectedIDs *set.Set[identity.NumericIdentity], rev uint64, oldRevCnt int)
+	Search(lbls labels.LabelArray) ([]*policyEntry, uint64)
 }
 
 type GetPolicyStatistics interface {
@@ -247,7 +247,7 @@ func (state *traceState) trace(rules int, ctx *SearchContext) {
 	}
 }
 
-func (p *Repository) Search(lbls labels.LabelArray) (api.Rules, uint64) {
+func (p *Repository) Search(lbls labels.LabelArray) ([]*policyEntry, uint64) {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
 	return p.searchRLocked(lbls), p.GetRevision()
@@ -255,12 +255,12 @@ func (p *Repository) Search(lbls labels.LabelArray) (api.Rules, uint64) {
 
 // searchRLocked searches the policy repository for rules which match the
 // specified labels and will return an array of all rules which matched.
-func (p *Repository) searchRLocked(lbls labels.LabelArray) api.Rules {
-	result := api.Rules{}
+func (p *Repository) searchRLocked(lbls labels.LabelArray) []*policyEntry {
+	result := []*policyEntry{}
 
 	for _, r := range p.rules {
-		if r.Labels.Contains(lbls) {
-			result = append(result, &r.Rule)
+		if r.labels.Contains(lbls) {
+			result = append(result, &r.policyEntry)
 		}
 	}
 
@@ -271,7 +271,7 @@ func (p *Repository) searchRLocked(lbls labels.LabelArray) api.Rules {
 // Expects that the entire rule list has already been sanitized.
 //
 // Only used by unit tests, but by multiple packages.
-func (p *Repository) addListLocked(rules api.Rules) (ruleSlice, uint64) {
+func (p *Repository) addListLocked(rules []*policyEntry) (ruleSlice, uint64) {
 	newRules := make(ruleSlice, 0, len(rules))
 	for _, r := range rules {
 		newRule := p.newRule(*r, ruleKey{idx: p.nextID})
@@ -285,7 +285,7 @@ func (p *Repository) addListLocked(rules api.Rules) (ruleSlice, uint64) {
 
 func (p *Repository) insert(r *rule) {
 	p.rules[r.key] = r
-	p.metricsManager.AddRule(r.Rule)
+	//p.metricsManager.AddRule(r.policyEntry)
 	if _, ok := p.rulesByNamespace[r.key.resource.Namespace()]; !ok {
 		p.rulesByNamespace[r.key.resource.Namespace()] = sets.New[ruleKey]()
 	}
@@ -306,7 +306,7 @@ func (p *Repository) del(key ruleKey) {
 	if r == nil {
 		return
 	}
-	p.metricsManager.DelRule(r.Rule)
+	//p.metricsManager.DelRule(r.policyEntry)
 	delete(p.rules, key)
 	p.rulesByNamespace[key.resource.Namespace()].Delete(key)
 	if len(p.rulesByNamespace[key.resource.Namespace()]) == 0 {
@@ -324,12 +324,12 @@ func (p *Repository) del(key ruleKey) {
 }
 
 // newRule allocates a CachedSelector for a given rule.
-func (p *Repository) newRule(apiRule api.Rule, key ruleKey) *rule {
+func (p *Repository) newRule(entry policyEntry, key ruleKey) *rule {
 	r := &rule{
-		Rule: apiRule,
-		key:  key,
+		policyEntry: entry,
+		key:         key,
 	}
-	r.subjectSelector, _ = p.selectorCache.AddIdentitySelector(r, makeStringLabels(r.Labels), *r.getSelector())
+	r.subjectSelector, _ = p.selectorCache.AddIdentitySelector(r, makeStringLabels(r.labels), *r.getSelector())
 	return r
 }
 
@@ -342,13 +342,15 @@ func (p *Repository) releaseRule(r *rule) {
 
 // MustAddList inserts a rule into the policy repository. It is used for
 // unit-testing purposes only. Panics if the rule is invalid
-func (p *Repository) MustAddList(rules api.Rules) (ruleSlice, uint64) {
-	for i := range rules {
-		err := rules[i].Sanitize()
-		if err != nil {
-			panic(err)
+func (p *Repository) MustAddList(rules []*policyEntry) (ruleSlice, uint64) {
+	/*
+		for i := range rules {
+			err := rules[i].Sanitize()
+			if err != nil {
+				panic(err)
+			}
 		}
-	}
+	*/
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	return p.addListLocked(rules)
@@ -356,17 +358,17 @@ func (p *Repository) MustAddList(rules api.Rules) (ruleSlice, uint64) {
 
 // Iterate iterates the policy repository, calling f for each rule. It is safe
 // to execute Iterate concurrently.
-func (p *Repository) Iterate(f func(rule *api.Rule)) {
+func (p *Repository) Iterate(f func(rule *policyEntry)) {
 	p.mutex.RWMutex.Lock()
 	defer p.mutex.RWMutex.Unlock()
 	for _, r := range p.rules {
-		f(&r.Rule)
+		f(&r.policyEntry)
 	}
 }
 
 // JSONMarshalRules returns a slice of policy rules as string in JSON
 // representation
-func JSONMarshalRules(rules api.Rules) string {
+func JSONMarshalRules(rules []*policyEntry) string {
 	b, err := json.MarshalIndent(rules, "", "  ")
 	if err != nil {
 		return err.Error()
@@ -534,21 +536,15 @@ func (p *Repository) computePolicyEnforcementAndRules(securityIdentity *identity
 	hasIngressDefaultDeny := false
 	hasEgressDefaultDeny := false
 	for _, r := range matchingRules {
-		if !ingress || !hasIngressDefaultDeny { // short-circuit len()
-			if len(r.Ingress) > 0 || len(r.IngressDeny) > 0 {
-				ingress = true
-				if *r.EnableDefaultDeny.Ingress {
-					hasIngressDefaultDeny = true
-				}
+		if r.ingress {
+			ingress = true
+			if r.defaultDeny {
+				hasIngressDefaultDeny = true
 			}
-		}
-
-		if !egress || !hasEgressDefaultDeny { // short-circuit len()
-			if len(r.Egress) > 0 || len(r.EgressDeny) > 0 {
-				egress = true
-				if *r.EnableDefaultDeny.Egress {
-					hasEgressDefaultDeny = true
-				}
+		} else {
+			egress = true
+			if r.defaultDeny {
+				hasEgressDefaultDeny = true
 			}
 		}
 		if ingress && egress && hasIngressDefaultDeny && hasEgressDefaultDeny {
@@ -573,33 +569,14 @@ func (p *Repository) computePolicyEnforcementAndRules(securityIdentity *identity
 
 // wildcardRule generates a wildcard rule that only selects the given identity.
 func wildcardRule(lbls labels.LabelArray, ingress bool) *rule {
-	r := &rule{}
-
-	if ingress {
-		r.Ingress = []api.IngressRule{
-			{
-				IngressCommonRule: api.IngressCommonRule{
-					FromEntities: []api.Entity{api.EntityAll},
-				},
-			},
-		}
-	} else {
-		r.Egress = []api.EgressRule{
-			{
-				EgressCommonRule: api.EgressCommonRule{
-					ToEntities: []api.Entity{api.EntityAll},
-				},
-			},
-		}
+	r := &rule{
+		policyEntry: policyEntry{
+			ingress:          ingress,
+			endpointSelector: api.NewESFromLabels(lbls...),
+			l3:               api.EndpointSelectorSlice{api.WildcardEndpointSelector},
+		},
 	}
-
-	es := api.NewESFromLabels(lbls...)
-	if lbls.Has(labels.IDNameHost) {
-		r.NodeSelector = es
-	} else {
-		r.EndpointSelector = es
-	}
-	_ = r.Sanitize()
+	//_ = r.Sanitize()
 
 	return r
 }
@@ -639,7 +616,7 @@ func (r *Repository) GetSelectorPolicy(id *identity.Identity, skipRevision uint6
 }
 
 // ReplaceByResource replaces all rules by resource, returning the complete set of affected endpoints.
-func (p *Repository) ReplaceByResource(rules api.Rules, resource ipcachetypes.ResourceID) (affectedIDs *set.Set[identity.NumericIdentity], rev uint64, oldRuleCnt int) {
+func (p *Repository) ReplaceByResource(rules []*policyEntry, resource ipcachetypes.ResourceID) (affectedIDs *set.Set[identity.NumericIdentity], rev uint64, oldRuleCnt int) {
 	if len(resource) == 0 {
 		// This should never ever be hit, as the caller should have already validated the resource.
 		// Out of paranoia, do nothing.
@@ -684,7 +661,7 @@ func (p *Repository) ReplaceByResource(rules api.Rules, resource ipcachetypes.Re
 // ReplaceByLabels implements the somewhat awkward REST local API for providing network policy,
 // where the "key" is a list of labels, possibly multiple, that should be removed before
 // installing the new rules.
-func (p *Repository) ReplaceByLabels(rules api.Rules, searchLabelsList []labels.LabelArray) (affectedIDs *set.Set[identity.NumericIdentity], rev uint64, oldRuleCnt int) {
+func (p *Repository) ReplaceByLabels(rules []*policyEntry, searchLabelsList []labels.LabelArray) (affectedIDs *set.Set[identity.NumericIdentity], rev uint64, oldRuleCnt int) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
@@ -693,7 +670,7 @@ func (p *Repository) ReplaceByLabels(rules api.Rules, searchLabelsList []labels.
 
 	// determine outgoing rules
 	for ruleKey, rule := range p.rules {
-		if slices.ContainsFunc(searchLabelsList, rule.Labels.Contains) {
+		if slices.ContainsFunc(searchLabelsList, rule.labels.Contains) {
 			p.del(ruleKey)
 			oldRules = append(oldRules, rule)
 		}
