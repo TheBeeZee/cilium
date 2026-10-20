@@ -116,7 +116,7 @@ jobs:
             SHA="${{ github.sha }}"
           fi
 
-          CILIUM_INSTALL_DEFAULTS="--chart-directory=install/kubernetes/cilium \
+          CILIUM_INSTALL_DEFAULTS="--chart-directory=untrusted/install/kubernetes/cilium \
             --set pprof.enabled=true \
             --helm-set=prometheus.enabled=true \
             --helm-set=dnsProxy.proxyResponseMaxDelay=100s \
@@ -248,6 +248,19 @@ jobs:
         uses: cilium/scale-tests-action/setup-firewall@529d919e01deb35642ba5c6ecdcbf2e2311cd3de # main
         with:
           cluster_name: ${{ steps.vars.outputs.cluster_name }}
+
+      # Warning: since this is a privileged workflow, subsequent workflow job
+      # steps must take care not to execute untrusted code.
+      - name: Checkout pull request branch (NOT TRUSTED)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.vars.outputs.sha }}
+          persist-credentials: false
+          # Required by checkout v7+ to fetch fork PR code; see the NOT TRUSTED warning above.
+          allow-unsafe-pr-checkout: true
+          path: untrusted
+          sparse-checkout: |
+            install/kubernetes/cilium
 
       - name: Install Cilium
         id: install-cilium

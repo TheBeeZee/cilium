@@ -119,10 +119,10 @@ jobs:
         with:
           comment_on_pr: false
 
-      - name: Checkout target branch to access local actions
+      - name: Checkout context ref (trusted)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.base_ref || github.ref }}
+          ref: ${{ inputs.context-ref || github.sha }}
           persist-credentials: false
 
       - name: Set Environment Variables
@@ -171,7 +171,7 @@ jobs:
           image-tag: ${{ steps.vars.outputs.sha }}
           registry_host: ${{ vars.DOCKER_READ_HOST }}
           registry_organization: ${{ vars.DOCKER_READ_ORG }}
-          chart-dir: 'install/kubernetes/cilium'
+          chart-dir: './untrusted/install/kubernetes/cilium'
           ipv6: false
           egress-gateway: false # Currently incompatible with CES
           misc: 'bpfClockProbe=false,cni.uninstall=false,hubble.relay.enabled=true'
@@ -186,6 +186,20 @@ jobs:
           image-tag: ${{ steps.vars.outputs.sha }}
           repository: ${{ env.CILIUM_CLI_RELEASE_REPO }}
           release-version: ${{ env.CILIUM_CLI_VERSION }}
+
+      # Warning: since this is a privileged workflow, subsequent workflow job
+      # steps must take care not to execute untrusted code.
+      - name: Checkout pull request branch (NOT TRUSTED)
+        if: ${{ steps.cilium-config.outputs.skip != 'true' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.vars.outputs.sha }}
+          persist-credentials: false
+          # Required by checkout v7+ to fetch fork PR code; see the NOT TRUSTED warning above.
+          allow-unsafe-pr-checkout: true
+          path: untrusted
+          sparse-checkout: |
+            install/kubernetes/cilium
 
       - name: Install Cilium
         if: ${{ steps.cilium-config.outputs.skip != 'true' }}
